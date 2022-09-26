@@ -1,13 +1,13 @@
-import torch
-import numpy as np
 from pathlib import Path
+
+import numpy as np
+import torch
 from pytorch3d.io import load_ply
 from pytorch3d.renderer import TexturesVertex
-from pytorch3d.structures.meshes import Meshes
-from pytorch3d.renderer.cameras import PerspectiveCameras
 from pytorch3d.renderer.blending import hard_rgb_blend, BlendParams
-from colmap.scripts.python.read_write_model import read_model
-
+from pytorch3d.renderer.cameras import PerspectiveCameras
+from pytorch3d.renderer.mesh.rasterizer import Fragments
+from pytorch3d.structures.meshes import Meshes
 
 p3dworld_to_colworld = torch.tensor([
     [0, 1, 0, 0],
@@ -28,7 +28,7 @@ class SimpleShader(torch.nn.Module):
         super().__init__()
         self.blend_params = blend_params if blend_params is not None else BlendParams()
 
-    def forward(self, fragments, meshes, **kwargs) -> torch.Tensor:
+    def forward(self, fragments: Fragments, meshes: Meshes, **kwargs) -> torch.Tensor:
         blend_params = kwargs.get('blend_params', self.blend_params)
         texels = meshes.sample_textures(fragments)
         images = hard_rgb_blend(texels, fragments, blend_params)
@@ -43,35 +43,24 @@ def load_openmvs_ply(mesh_path: Path, device: str = 'cpu') -> Meshes:
     return Meshes(verts, faces, textures=textures).to(device)
 
 
-def pytorch3d_cameras_from_colmap(colmap_model_dir: Path, device: str = 'cpu') -> tuple[list[str], PerspectiveCameras]:
-    colmap_cameras, colmap_images, _ = read_model(colmap_model_dir)
-    image_names, fs, cs, rs, ts, hws = [], [], [], [], [], []
-    for colmap_image in colmap_images.values():
-        colmap_camera = colmap_cameras[colmap_image.camera_id]
-        if colmap_camera.model != 'PINHOLE':
-            print(f'Ignoring image {colmap_image.name}: {colmap_camera.model} camera model.')
-        else:
-            fx, fy, u0, v0 = colmap_camera.params
-            r = colmap_image.qvec2rotmat()
-            t = colmap_image.tvec.reshape(3, 1)
-            colworld_to_colcam = torch.tensor(np.vstack([
-                np.hstack([r, t]),
-                [0, 0, 0, 1]
-            ]), dtype=torch.float32)
-            p3dworld_to_p3dcam = colcam_to_p3dcam @ colworld_to_colcam @ p3dworld_to_colworld
-            image_names.append(colmap_image.name)
-            fs.append(torch.tensor([fx, fy], dtype=torch.float32))
-            cs.append(torch.tensor([u0, v0], dtype=torch.float32))
-            rs.append(p3dworld_to_p3dcam[:3, :3].T)
-            ts.append(p3dworld_to_p3dcam[:3, 3])
-            hws.append(torch.tensor([colmap_camera.height, colmap_camera.width]))
-    cameras = PerspectiveCameras(
-        focal_length=torch.stack(fs),
-        principal_point=torch.stack(cs),
-        R=torch.stack(rs),
-        T=torch.stack(ts),
-        image_size=torch.stack(hws),
+def p3d_cam_from_colmap(colmap_image, colmap_camera, device: str = 'cpu') -> PerspectiveCameras:
+    assert colmap_camera.model == 'PINHOLE', \
+        f'Camera {colmap_camera.id} model is {colmap_camera.model}, only PINHOLE model is supported.'
+    fx, fy, cx, cy = colmap_camera.params
+    r = colmap_image.qvec2rotmat()
+    t = colmap_image.tvec.reshape(3, 1)
+    colworld_to_colcam = torch.tensor(np.vstack([
+        np.hstack([r, t]),
+        [0, 0, 0, 1]
+    ]), dtype=torch.float32)
+    p3dworld_to_p3dcam = colcam_to_p3dcam @ colworld_to_colcam @ p3dworld_to_colworld
+    p3d_cam = PerspectiveCameras(
+        focal_length=torch.tensor([[fx, fy]], dtype=torch.float32),
+        principal_point=torch.tensor([[cx, cy]], dtype=torch.float32),
+        R=p3dworld_to_p3dcam[:3, :3].T.unsqueeze(dim=0),
+        T=p3dworld_to_p3dcam[:3, 3].unsqueeze(dim=0),
+        image_size=torch.tensor([[colmap_camera.height, colmap_camera.width]]),
         in_ndc=False,
         device=device
     )
-    return image_names, cameras
+    return p3d_cam
